@@ -1,0 +1,5 @@
+.env
+analytics.db
+venv/
+__pycache__/
+.pytest_cache/
