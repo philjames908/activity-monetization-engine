@@ -7,13 +7,15 @@
   <style>
     body { font-family: system-ui, sans-serif; max-width: 680px; margin: 3rem auto; padding: 0 1rem; line-height: 1.5; }
     .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; }
-    button { padding: 0.6rem 1.2rem; font-size: 1rem; border-radius: 6px; border: none; cursor: pointer; margin-right: 0.5rem; }
+    button { padding: 0.6rem 1.2rem; font-size: 1rem; border-radius: 6px; border: none; cursor: pointer; margin-right: 0.5rem; margin-top: 0.4rem; }
     .btn-primary { background: #2563eb; color: white; }
     .btn-upgrade { background: #16a34a; color: white; }
     .btn-portal { background: #4b5563; color: white; }
+    .btn-key { background: #0f766e; color: white; }
     button:disabled { background: #9ca3af; cursor: not-allowed; }
     #paywall { display: none; background: #fef2f2; border-color: #ef4444; }
     #pro-panel { display: none; background: #f0fdf4; border-color: #16a34a; }
+    .key-box { background: #ecfdf5; border: 1px dashed #059669; padding: 0.75rem; border-radius: 6px; margin: 0.75rem 0; font-family: monospace; word-break: break-all; }
     table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; font-size: 0.9rem; }
     th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #e5e7eb; }
     th { background: #f8fafc; font-weight: 600; }
@@ -35,13 +37,15 @@
 
   <div id="paywall" class="card">
     <h3>Free Quota Exhausted</h3>
-    <p>You have reached the 20-event free limit. Subscribe for $9.99/month for unlimited tracking and data exports.</p>
+    <p>You have reached the 20-event free limit. Subscribe for $9.99/month for unlimited tracking, API key authentication, and data exports.</p>
     <button id="upgrade-btn" class="btn-upgrade">Subscribe ($9.99/mo)</button>
   </div>
 
   <div id="pro-panel" class="card">
     <h3>Pro Subscription Active</h3>
-    <p>You have unlimited tracking and API exports.</p>
+    <p><strong>Active API Key:</strong> <code id="api-key-display">None generated yet</code></p>
+    <div id="new-key-banner" class="key-box" style="display:none;"></div>
+    <button id="rotate-key-btn" class="btn-key">Generate / Rotate API Key</button>
     <button id="portal-btn" class="btn-portal">Manage or Cancel Subscription</button>
   </div>
 
@@ -64,6 +68,7 @@
   <script src="tracker.js"></script>
   <script>
     const API_BASE = "http://localhost:8000/api/v1";
+    const API_KEY_STORAGE = "activity_pro_api_key";
 
     async function loadBillingHistory(visitorId) {
       const res = await fetch(`${API_BASE}/billing-history`, {
@@ -115,22 +120,26 @@
       const paywall = document.getElementById("paywall");
       const proPanel = document.getElementById("pro-panel");
       const statusText = document.getElementById("quota-status");
+      const keyDisplay = document.getElementById("api-key-display");
 
       if (data.is_premium) {
         statusText.textContent = `Pro Plan Active (${data.total_events} events logged)`;
         actionBtn.disabled = false;
         paywall.style.display = "none";
         proPanel.style.display = "block";
+        keyDisplay.textContent = data.api_key_prefix || "Click Rotate Key to reveal a new key";
       } else if (data.allowed) {
         statusText.textContent = `Free Tier (${data.remaining} events remaining)`;
         actionBtn.disabled = false;
         paywall.style.display = "none";
         proPanel.style.display = "none";
+        localStorage.removeItem(API_KEY_STORAGE);
       } else {
         statusText.textContent = "Free Tier (0 events remaining - Locked)";
         actionBtn.disabled = true;
         paywall.style.display = "block";
         proPanel.style.display = "none";
+        localStorage.removeItem(API_KEY_STORAGE);
       }
 
       await loadBillingHistory(visitorId);
@@ -143,14 +152,35 @@
 
     document.getElementById("export-btn").addEventListener("click", async () => {
       const visitorId = window.ActivityTracker.getVisitorId();
+      const storedKey = localStorage.getItem(API_KEY_STORAGE);
       const out = document.getElementById("export-output");
       out.style.display = "block";
 
-      const res = await fetch(`${API_BASE}/export-data`, {
-        headers: { "X-Visitor-ID": visitorId }
-      });
+      const headers = { "X-Visitor-ID": visitorId };
+      if (storedKey) headers["X-API-Key"] = storedKey;
+
+      const res = await fetch(`${API_BASE}/export-data`, { headers });
       const data = await res.json();
       out.textContent = `HTTP ${res.status}\n` + JSON.stringify(data, null, 2);
+    });
+
+    document.getElementById("rotate-key-btn").addEventListener("click", async () => {
+      const visitorId = window.ActivityTracker.getVisitorId();
+      const res = await fetch(`${API_BASE}/rotate-key`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ visitor_id: visitorId })
+      });
+      const data = await res.json();
+      if (res.ok && data.api_key) {
+        localStorage.setItem(API_KEY_STORAGE, data.api_key);
+        const banner = document.getElementById("new-key-banner");
+        banner.style.display = "block";
+        banner.innerHTML = `<strong>New Secret Key (Saved to Browser):</strong><br/>${data.api_key}`;
+        document.getElementById("api-key-display").textContent = data.api_key_prefix;
+      } else {
+        alert(data.detail || "Unable to rotate API key.");
+      }
     });
 
     document.getElementById("upgrade-btn").addEventListener("click", async () => {

@@ -1,4 +1,7 @@
 import os
+import hmac
+import hashlib
+import secrets
 import sqlite3
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
@@ -9,7 +12,7 @@ import stripe
 
 load_dotenv()
 
-app = FastAPI(title="Activity Monetization Engine", version="2.0.0")
+app = FastAPI(title="Activity Monetization Engine", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,6 +26,18 @@ stripe.api_key = os.getenv("STRIPE_API_KEY", "")
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 DB_NAME = "analytics.db"
 FREE_LIMIT = 20
+
+
+def generate_api_key() -> tuple[str, str, str]:
+    """Generate a raw API key, its SHA-256 hex digest, and a display prefix."""
+    raw_key = f"ak_live_{secrets.token_hex(24)}"
+    key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    key_prefix = f"{raw_key[:12]}..."
+    return raw_key, key_hash, key_prefix
+
+
+def hash_api_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
 def init_db():
@@ -46,7 +61,9 @@ def init_db():
                 total_events INTEGER DEFAULT 0,
                 is_premium INTEGER DEFAULT 0,
                 stripe_customer_id TEXT,
-                stripe_subscription_id TEXT
+                stripe_subscription_id TEXT,
+                api_key_hash TEXT,
+                api_key_prefix TEXT
             )
         """)
         cursor.execute("""
@@ -62,12 +79,16 @@ def init_db():
             )
         """)
 
-        # Migrate existing local tables cleanly if columns are missing
+        # Non-destructive schema migration for existing local databases
         usage_cols = [r[1] for r in cursor.execute("PRAGMA table_info(visitor_usage)").fetchall()]
         if "stripe_customer_id" not in usage_cols:
             cursor.execute("ALTER TABLE visitor_usage ADD COLUMN stripe_customer_id TEXT")
         if "stripe_subscription_id" not in usage_cols:
             cursor.execute("ALTER TABLE visitor_usage ADD COLUMN stripe_subscription_id TEXT")
+        if "api_key_hash" not in usage_cols:
+            cursor.execute("ALTER TABLE visitor_usage ADD COLUMN api_key_hash TEXT")
+        if "api_key_prefix" not in usage_cols:
+            cursor.execute("ALTER TABLE visitor_usage ADD COLUMN api_key_prefix TEXT")
 
         pay_cols = [r[1] for r in cursor.execute("PRAGMA table_info(payments)").fetchall()]
         if "event_type" not in pay_cols:
@@ -115,17 +136,36 @@ def log_event_worker(event: TrackEvent, client_ip: str):
         conn.commit()
 
 
-async def verify_access(x_visitor_id: str = Header(..., description="Visitor ID header")):
+async def verify_access(
+    x_visitor_id: str = Header(..., description="Visitor ID header"),
+    x_api_key: Optional[str] = Header(None, description="Pro Subscriber API Key"),
+):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT total_events, is_premium FROM visitor_usage WHERE visitor_id = ?", (x_visitor_id,))
+        cursor.execute(
+            "SELECT total_events, is_premium, api_key_hash FROM visitor_usage WHERE visitor_id = ?",
+            (x_visitor_id,)
+        )
         row = cursor.fetchone()
 
     if not row:
         return {"visitor_id": x_visitor_id, "tier": "free"}
 
-    total_events, is_premium = row
+    total_events, is_premium, stored_hash = row
+
     if is_premium:
+        if stored_hash:
+            if not x_api_key:
+                raise HTTPException(
+                    status_code=401,
+                    detail={"error": "missing_api_key", "message": "Pro tier requires an X-API-Key header."}
+                )
+            provided_hash = hash_api_key(x_api_key)
+            if not hmac.compare_digest(provided_hash, stored_hash):
+                raise HTTPException(
+                    status_code=401,
+                    detail={"error": "invalid_api_key", "message": "Provided X-API-Key is invalid or revoked."}
+                )
         return {"visitor_id": x_visitor_id, "tier": "premium"}
 
     if total_events >= FREE_LIMIT:
@@ -153,22 +193,29 @@ async def check_quota(visitor_id: str):
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT total_events, is_premium, stripe_subscription_id FROM visitor_usage WHERE visitor_id = ?",
+            "SELECT total_events, is_premium, stripe_subscription_id, api_key_prefix FROM visitor_usage WHERE visitor_id = ?",
             (visitor_id,)
         )
         row = cursor.fetchone()
 
     if not row:
-        return {"allowed": True, "remaining": FREE_LIMIT, "is_premium": False, "subscription_id": None}
+        return {
+            "allowed": True,
+            "remaining": FREE_LIMIT,
+            "is_premium": False,
+            "subscription_id": None,
+            "api_key_prefix": None,
+        }
 
-    total_events, is_premium, sub_id = row
+    total_events, is_premium, sub_id, key_prefix = row
     if is_premium:
         return {
             "allowed": True,
             "total_events": total_events,
             "remaining": -1,
             "is_premium": True,
-            "subscription_id": sub_id
+            "subscription_id": sub_id,
+            "api_key_prefix": key_prefix,
         }
 
     remaining = max(0, FREE_LIMIT - total_events)
@@ -177,7 +224,40 @@ async def check_quota(visitor_id: str):
         "total_events": total_events,
         "remaining": remaining,
         "is_premium": False,
-        "subscription_id": sub_id
+        "subscription_id": sub_id,
+        "api_key_prefix": None,
+    }
+
+
+@app.post("/api/v1/rotate-key")
+async def rotate_api_key(payload: CheckoutRequest):
+    """Issue or rotate a Pro subscriber's API key, storing only its SHA-256 digest."""
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT is_premium FROM visitor_usage WHERE visitor_id = ?",
+            (payload.visitor_id,)
+        )
+        row = cursor.fetchone()
+
+        if not row or not row[0]:
+            raise HTTPException(
+                status_code=403,
+                detail="Active Pro subscription required to generate or rotate an API key."
+            )
+
+        raw_key, key_hash, key_prefix = generate_api_key()
+        cursor.execute(
+            "UPDATE visitor_usage SET api_key_hash = ?, api_key_prefix = ? WHERE visitor_id = ?",
+            (key_hash, key_prefix, payload.visitor_id)
+        )
+        conn.commit()
+
+    return {
+        "visitor_id": payload.visitor_id,
+        "api_key": raw_key,
+        "api_key_prefix": key_prefix,
+        "warning": "Store this key securely now; it will not be shown again."
     }
 
 
@@ -228,98 +308,6 @@ async def create_checkout(payload: CheckoutRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/v1/webhook")
-async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
-    payload = await request.body()
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload=payload,
-            sig_header=stripe_signature,
-            secret=WEBHOOK_SECRET
-        )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    event_id = event["id"]
-    event_type = event["type"]
-    data_obj = event["data"]["object"]
-
-    # 1. Subscription started via Checkout
-    if event_type == "checkout.session.completed":
-        session_id = getattr(data_obj, "id", "unknown")
-        visitor_id = getattr(data_obj, "client_reference_id", None)
-        customer_id = getattr(data_obj, "customer", None)
-        subscription_id = getattr(data_obj, "subscription", None)
-        amount_total = getattr(data_obj, "amount_total", 0)
-        currency = getattr(data_obj, "currency", "usd")
-
-        if visitor_id:
-            with sqlite3.connect(DB_NAME) as conn:
-                cursor = conn.cursor()
-                try:
-                    cursor.execute("""
-                        INSERT INTO payments (stripe_event_id, checkout_session_id, visitor_id, amount_total, currency, event_type)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (event_id, session_id, visitor_id, amount_total, currency, event_type))
-                except sqlite3.IntegrityError:
-                    print(f"[WEBHOOK] Duplicate event ignored: {event_id}")
-                    return {"status": "already_processed"}
-
-                cursor.execute("""
-                    INSERT INTO visitor_usage (visitor_id, total_events, is_premium, stripe_customer_id, stripe_subscription_id)
-                    VALUES (?, 0, 1, ?, ?)
-                    ON CONFLICT(visitor_id) DO UPDATE SET
-                        is_premium = 1,
-                        stripe_customer_id = excluded.stripe_customer_id,
-                        stripe_subscription_id = excluded.stripe_subscription_id
-                """, (visitor_id, customer_id, subscription_id))
-                conn.commit()
-            print(f"[WEBHOOK] Activated subscription ({subscription_id}) for visitor: {visitor_id}")
-
-    # 2. Subscription canceled or expired -> Revoke Premium access
-    elif event_type == "customer.subscription.deleted":
-        subscription_id = getattr(data_obj, "id", None)
-        customer_id = getattr(data_obj, "customer", None)
-        metadata = getattr(data_obj, "metadata", None)
-        visitor_id = getattr(metadata, "visitor_id", None) if metadata else None
-
-        with sqlite3.connect(DB_NAME) as conn:
-            cursor = conn.cursor()
-
-            # Fallback lookup by stripe_subscription_id if metadata wasn't attached
-            if not visitor_id and subscription_id:
-                cursor.execute(
-                    "SELECT visitor_id FROM visitor_usage WHERE stripe_subscription_id = ?",
-                    (subscription_id,)
-                )
-                row = cursor.fetchone()
-                if row:
-                    visitor_id = row[0]
-
-            if visitor_id:
-                try:
-                    cursor.execute("""
-                        INSERT INTO payments (stripe_event_id, checkout_session_id, visitor_id, amount_total, currency, event_type)
-                        VALUES (?, ?, ?, 0, 'usd', ?)
-                    """, (event_id, subscription_id or "sub_deleted", visitor_id, event_type))
-                except sqlite3.IntegrityError:
-                    print(f"[WEBHOOK] Duplicate cancellation ignored: {event_id}")
-                    return {"status": "already_processed"}
-
-                cursor.execute("""
-                    UPDATE visitor_usage
-                    SET is_premium = 0
-                    WHERE visitor_id = ?
-                """, (visitor_id,))
-                conn.commit()
-                print(f"[WEBHOOK] Subscription canceled ({subscription_id}) -> Revoked access for: {visitor_id}")
-
-    return {"status": "success"}
-
-
 @app.post("/api/v1/create-portal-session")
 async def create_portal_session(payload: CheckoutRequest):
     with sqlite3.connect(DB_NAME) as conn:
@@ -336,11 +324,9 @@ async def create_portal_session(payload: CheckoutRequest):
             detail="No active Stripe customer record found for this visitor."
         )
 
-    customer_id = row[0]
-
     try:
         portal_session = stripe.billing_portal.Session.create(
-            customer=customer_id,
+            customer=row[0],
             return_url="http://localhost:3000/",
         )
         return {"portal_url": portal_session.url}
@@ -377,3 +363,97 @@ async def get_billing_history(x_visitor_id: str = Header(..., description="Visit
         "total_records": len(records),
         "history": records,
     }
+
+
+@app.post("/api/v1/webhook")
+async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
+    payload = await request.body()
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=stripe_signature,
+            secret=WEBHOOK_SECRET
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    event_id = event["id"]
+    event_type = event["type"]
+    data_obj = event["data"]["object"]
+
+    if event_type == "checkout.session.completed":
+        session_id = getattr(data_obj, "id", "unknown")
+        visitor_id = getattr(data_obj, "client_reference_id", None)
+        customer_id = getattr(data_obj, "customer", None)
+        subscription_id = getattr(data_obj, "subscription", None)
+        amount_total = getattr(data_obj, "amount_total", 0)
+        currency = getattr(data_obj, "currency", "usd")
+
+        if visitor_id:
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("""
+                        INSERT INTO payments (stripe_event_id, checkout_session_id, visitor_id, amount_total, currency, event_type)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (event_id, session_id, visitor_id, amount_total, currency, event_type))
+                except sqlite3.IntegrityError:
+                    print(f"[WEBHOOK] Duplicate event ignored: {event_id}")
+                    return {"status": "already_processed"}
+
+                _, key_hash, key_prefix = generate_api_key()
+                cursor.execute("""
+                    INSERT INTO visitor_usage (
+                        visitor_id, total_events, is_premium, stripe_customer_id,
+                        stripe_subscription_id, api_key_hash, api_key_prefix
+                    )
+                    VALUES (?, 0, 1, ?, ?, ?, ?)
+                    ON CONFLICT(visitor_id) DO UPDATE SET
+                        is_premium = 1,
+                        stripe_customer_id = excluded.stripe_customer_id,
+                        stripe_subscription_id = excluded.stripe_subscription_id,
+                        api_key_hash = COALESCE(visitor_usage.api_key_hash, excluded.api_key_hash),
+                        api_key_prefix = COALESCE(visitor_usage.api_key_prefix, excluded.api_key_prefix)
+                """, (visitor_id, customer_id, subscription_id, key_hash, key_prefix))
+                conn.commit()
+            print(f"[WEBHOOK] Activated subscription ({subscription_id}) & provisioned API key for: {visitor_id}")
+
+    elif event_type == "customer.subscription.deleted":
+        subscription_id = getattr(data_obj, "id", None)
+        metadata = getattr(data_obj, "metadata", None)
+        visitor_id = getattr(metadata, "visitor_id", None) if metadata else None
+
+        with sqlite3.connect(DB_NAME) as conn:
+            cursor = conn.cursor()
+
+            if not visitor_id and subscription_id:
+                cursor.execute(
+                    "SELECT visitor_id FROM visitor_usage WHERE stripe_subscription_id = ?",
+                    (subscription_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    visitor_id = row[0]
+
+            if visitor_id:
+                try:
+                    cursor.execute("""
+                        INSERT INTO payments (stripe_event_id, checkout_session_id, visitor_id, amount_total, currency, event_type)
+                        VALUES (?, ?, ?, 0, 'usd', ?)
+                    """, (event_id, subscription_id or "sub_deleted", visitor_id, event_type))
+                except sqlite3.IntegrityError:
+                    print(f"[WEBHOOK] Duplicate cancellation ignored: {event_id}")
+                    return {"status": "already_processed"}
+
+                cursor.execute("""
+                    UPDATE visitor_usage
+                    SET is_premium = 0, api_key_hash = NULL, api_key_prefix = NULL
+                    WHERE visitor_id = ?
+                """, (visitor_id,))
+                conn.commit()
+                print(f"[WEBHOOK] Subscription canceled ({subscription_id}) -> Revoked access & API key for: {visitor_id}")
+
+    return {"status": "success"}
